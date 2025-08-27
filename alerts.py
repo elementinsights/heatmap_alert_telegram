@@ -21,7 +21,7 @@ WATCH_COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "HYPE"]
 TIMEFRAMES  = ["12h", "24h", "72h"]
 
 DEFAULT_WINDOW_PCT  = 5.0       # ± window for Above/Below totals
-DEFAULT_THRESHOLD   = 0.20      # ±30% threshold
+DEFAULT_THRESHOLD   = 0.30      # ±30% threshold
 DEFAULT_INTERVAL_S  = 300       # run every 5 minutes
 STATE_FILE          = "alerts_state.json"
 PER_REQUEST_PAUSE   = 0.5       # throttle between API requests (s)
