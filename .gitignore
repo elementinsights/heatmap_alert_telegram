@@ -58,3 +58,4 @@ alerts.log
 
 # --- Misc backups ---
 *~
+service_account.json
