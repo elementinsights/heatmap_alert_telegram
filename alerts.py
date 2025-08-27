@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """
-Headless Coinglass Model-2 heatmap alert runner with startup alerts & reset.
-- Watches: BTC, ETH, SOL, XRP, DOGE, HYPE
-- Timeframes: 12h, 24h, 72h
-- Triggers on crossings of ±threshold within ±window
-- On first run: configurable via --startup {over,all,none}
+Coinglass Model-2 heatmap alert runner (Telegram).
+- Crossing alerts (|imbalance| >= threshold)
+- Shock alerts (|Δimbalance| >= shock_delta within shock_minutes)
+- Stores short imbalance history per coin×timeframe in alerts_state.json
 """
 
-import os, json, math, time, ssl, smtplib, requests, argparse, datetime as dt
-from email.utils import formatdate
+import os, json, math, time, requests, argparse, datetime as dt
 from collections import defaultdict
 from dotenv import load_dotenv
 
-# ------------ DEFAULT CONFIG ------------
+# ------------ CONFIG ------------
 API_HOST = "https://open-api-v4.coinglass.com"
 COIN_ENDPOINT = "/api/futures/liquidation/aggregated-heatmap/model2"
 PAIR_ENDPOINT = "/api/futures/liquidation/heatmap/model2"
@@ -20,13 +18,25 @@ PAIR_ENDPOINT = "/api/futures/liquidation/heatmap/model2"
 WATCH_COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "HYPE"]
 TIMEFRAMES  = ["12h", "24h", "72h"]
 
-DEFAULT_WINDOW_PCT  = 5.0       # ± window for Above/Below totals
-DEFAULT_THRESHOLD   = 0.30      # ±30% threshold
-DEFAULT_INTERVAL_S  = 300       # run every 5 minutes
+DEFAULT_WINDOW_PCT  = 5.0
+DEFAULT_THRESHOLD   = 0.30      # crossing threshold (±30%)
+DEFAULT_INTERVAL_S  = 120
 STATE_FILE          = "alerts_state.json"
-PER_REQUEST_PAUSE   = 0.5       # throttle between API requests (s)
+PER_REQUEST_PAUSE   = 0.5
 
-# ------------ API HELPERS ------------
+# Shock rules: per-timeframe Δimb must happen within this many minutes
+SHOCK_RULES = {
+    "12h": {"delta": 0.30, "minutes": 15,  "cooldown_min": 15},
+    "24h": {"delta": 0.30, "minutes": 120, "cooldown_min": 60},
+    "72h": {"delta": 0.30, "minutes": 360, "cooldown_min": 180},
+}
+# How much history to retain (minutes). Keep comfortably above the largest window.
+MAX_HISTORY_MINUTES = max(v["minutes"] for v in SHOCK_RULES.values()) * 3
+
+# ------------ Helpers ------------
+def now_utc() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
 def get_api_key() -> str:
     load_dotenv()
     k = os.getenv("COINGLASS_API_KEY")
@@ -96,7 +106,7 @@ def fetch_any(currency: str, timeframe: str):
         pair = currency.upper().strip() + "USDT"
         return fetch_pair_model2_raw(pair, timeframe)
 
-# ------------ DATA SHAPING ------------
+# ------------ Data shaping ------------
 def last_close(price_candles):
     if not price_candles or len(price_candles[-1]) < 5:
         raise RuntimeError("price_candlesticks missing/short")
@@ -130,10 +140,9 @@ def imbalance(below, above):
     denom = ta + tb
     return ((ta - tb)/denom if denom else 0.0), ta, tb
 
-# ------------ STATE & EMAIL ------------
+# ------------ State I/O ------------
 def load_state(reset=False):
-    if reset:
-        return {}
+    if reset: return {}
     try:
         with open(STATE_FILE, "r") as f:
             return json.load(f)
@@ -147,34 +156,59 @@ def save_state(state: dict):
     except Exception:
         pass
 
-def send_email(subject: str, body: str) -> bool:
+# ------------ Telegram ------------
+def send_telegram(text: str) -> bool:
     load_dotenv()
-    host = os.getenv("SMTP_HOST", "smtp.gmail.com")
-    port = int(os.getenv("SMTP_PORT", "587"))
-    user = os.getenv("SMTP_USERNAME")
-    pwd  = os.getenv("SMTP_PASSWORD")
-    sender = os.getenv("EMAIL_FROM", user or "")
-    recipients = [a.strip() for a in os.getenv("EMAIL_TO", "").split(",") if a.strip()]
-    if not (user and pwd and sender and recipients):
-        print("[warn] Email not sent: missing SMTP_USERNAME/SMTP_PASSWORD/EMAIL_FROM/EMAIL_TO in .env")
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("TELEGRAM_CHANNEL")
+    if not (token and chat_id):
+        print("[warn] Telegram not sent: missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
         return False
-    msg = f"From: {sender}\nTo: {', '.join(recipients)}\nDate: {formatdate(localtime=True)}\nSubject: {subject}\n\n{body}"
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     try:
-        with smtplib.SMTP(host, port, timeout=20) as s:
-            s.ehlo(); s.starttls(context=ssl.create_default_context())
-            s.login(user, pwd); s.sendmail(sender, recipients, msg.encode("utf-8"))
-        return True
+        r = requests.post(url, json=payload, timeout=15)
+        ok = (r.status_code == 200 and r.json().get("ok") is True)
+        if not ok: print("[error] Telegram send failed:", r.text)
+        return ok
     except Exception as e:
-        print("[error] Email send failed:", e); return False
+        print("[error] Telegram exception:", e); return False
 
-# ------------ RUN LOOP ------------
-def run_once(window_pct, threshold, startup_mode, state, first_cycle=False):
-    """
-    startup_mode: 'over' (alert on first run if |imb|>=thr), 'all' (alert all on first run), 'none'
-    first_cycle: True only on the first loop iteration after start/reset
-    """
+# ------------ Shock detection ------------
+def prune_history(hist, now_ts):
+    """Keep only recent history needed for shock checks."""
+    keep_seconds = MAX_HISTORY_MINUTES * 60
+    return [pt for pt in hist if now_ts - pt[0] <= keep_seconds][-500:]  # also cap length
+
+def detect_shock(tf, hist, now_imb, now_ts):
+    """Return (is_shock, prev_imb, dt_minutes) based on SHOCK_RULES[tf]."""
+    rule = SHOCK_RULES.get(tf)
+    if not rule: return (False, None, None)
+    window = rule["minutes"] * 60
+    delta_needed = rule["delta"]
+    # Walk backwards through history inside the window
+    for ts, prev_imb in reversed(hist):
+        dt_sec = now_ts - ts
+        if dt_sec > window:
+            break
+        if abs(now_imb - prev_imb) >= delta_needed:
+            return True, prev_imb, round(dt_sec / 60, 1)
+    return False, None, None
+
+def cooldown_ok(last_ts_str, cooldown_min, now_ts):
+    if not last_ts_str: return True
+    try:
+        last_ts = dt.datetime.fromisoformat(last_ts_str).timestamp()
+    except Exception:
+        return True
+    return (now_ts - last_ts) >= cooldown_min * 60
+
+# ------------ Run loop ------------
+def run_once(window_pct, threshold, startup_mode, state):
     lines = []
-    utc_now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    utc_now_dt = now_utc()
+    utc_now = utc_now_dt.strftime("%Y-%m-%d %H:%M:%S")
+    now_ts = utc_now_dt.timestamp()
 
     for coin in WATCH_COINS:
         for tf in TIMEFRAMES:
@@ -191,82 +225,97 @@ def run_once(window_pct, threshold, startup_mode, state, first_cycle=False):
                 continue
 
             key = f"{coin}:{tf}"
-            prev = state.get(key)
+            rec = state.get(key, {})
+            hist = rec.get("hist", [])
+            # Append current point and prune
+            hist.append([now_ts, float(imb)])
+            hist = prune_history(hist, now_ts)
+
+            # Crossing logic (unchanged)
+            prev_active = bool(rec.get("active"))
+            prev_sign = int(rec.get("sign", 0))
             active_now = abs(imb) >= threshold
             sign_now = 1 if imb > 0 else (-1 if imb < 0 else 0)
 
-            crossed = False
-            reason = ""
-            if prev is None:
-                # first time we've seen this pair this process (or after reset)
+            crossed = False; reason = ""
+            if "active" not in rec:
                 if startup_mode == "all":
                     crossed = True; reason = "initial(all)"
                 elif startup_mode == "over" and active_now:
                     crossed = True; reason = "initial(over)"
-                else:
-                    crossed = False
             else:
-                # normal crossing logic
-                prev_active = bool(prev.get("active"))
-                prev_sign = int(prev.get("sign", 0))
                 crossed = active_now and (not prev_active or prev_sign != sign_now)
                 if crossed: reason = "crossing"
 
+            # Shock logic
+            is_shock, prev_imb, dt_min = detect_shock(tf, hist[:-1], imb, now_ts)
+            shock_ok = False
+            if is_shock:
+                rule = SHOCK_RULES[tf]
+                shock_ok = cooldown_ok(rec.get("last_shock_alert_utc"), rule["cooldown_min"], now_ts)
+
             status = "OK "
-            if crossed:
-                status = "ALRT"
-                direction = "Above>Below" if imb > 0 else "Below>Above"
-                subject = f"[Heatmap Alert] {coin} {tf} imbalance {imb:.2%} ({direction})"
-                body = (
-                    f"Coin: {coin}\nTimeframe: {tf}\n±Window: {window_pct}%\n"
-                    f"Imbalance: {imb:.2%} ({direction})\n"
-                    f"Above total: ${ta:,.0f}\nBelow total: ${tb:,.0f}\n"
-                    f"Last price: ${price:,.2f}\nSource: {source}\n"
-                    f"Params: {params}\nUTC: {utc_now}\nNote: {reason}\n"
-                )
-                emailed = send_email(subject, body)
-                status += "✉" if emailed else "✉✗"
+            # Build messages
+            if crossed or (is_shock and shock_ok):
+                direction = "Above→Below" if imb > 0 else "Below→Above"
+                parts = [f"<b>Heatmap Alert</b> {coin} • {tf}"]
+                if crossed:
+                    parts.append(f"Crossing: <b>{imb:.2%}</b> ({direction}) ≥ {threshold:.0%}")
+                if is_shock and shock_ok:
+                    d = abs(imb - prev_imb)
+                    parts.append(f"⚡ Shock: Δ{d:.2%} in {dt_min} min (from {prev_imb:.2%})")
+                parts += [
+                    f"Window: ±{window_pct}%",
+                    f"Above: ${ta:,.0f} • Below: ${tb:,.0f}",
+                    f"Last price: ${price:,.2f}",
+                    f"Source: {source}",
+                    f"Params: {params}",
+                    f"UTC: {utc_now}",
+                    f"Note: {reason}" if reason else "",
+                ]
+                text = "\n".join(p for p in parts if p)
+                sent = send_telegram(text)
+                status += "📣" if sent else "📣✗"
 
             lines.append(f"{utc_now} | {coin:<5} {tf:<4} | imb={imb:>+6.2%} | "
-                         f"above=${ta:>12,.0f} | below=${tb:>12,.0f} | {status} {reason}")
+                         f"above=${ta:>12,.0f} | below=${tb:>12,.0f} | {status}")
 
-            # update state
-            state[key] = {
+            # Update state
+            rec.update({
                 "active": active_now,
                 "sign": sign_now,
-                "last_imbalance": imb,
-                "last_checked_utc": utc_now
-            }
+                "last_imbalance": float(imb),
+                "last_checked_utc": now_utc().isoformat(),
+                "hist": hist,
+            })
+            if is_shock and shock_ok:
+                rec["last_shock_alert_utc"] = now_utc().isoformat()
+            state[key] = rec
 
     return lines, state
 
 def main():
-    ap = argparse.ArgumentParser(description="Coinglass Heatmap Alert Runner")
+    ap = argparse.ArgumentParser(description="Coinglass Heatmap Alert Runner (Telegram + Shock)")
     ap.add_argument("--window", type=float, default=DEFAULT_WINDOW_PCT, help="±window percent (default 5.0)")
-    ap.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help="imbalance threshold (0.30=30%%)")
+    ap.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help="crossing threshold (0.30=30%%)")
     ap.add_argument("--interval", type=int, default=DEFAULT_INTERVAL_S, help="seconds between checks (default 300)")
     ap.add_argument("--startup", choices=["over","all","none"], default="over",
-                    help="first-run behavior: 'over'=alert if already over threshold (default); "
-                         "'all'=alert everything on first run; 'none'=no first-run alerts")
-    ap.add_argument("--reset-state", action="store_true", help="ignore prior state on startup")
+                    help="first run: 'over' (alert if already ≥ thr), 'all' (alert everything once), 'none'")
+    ap.add_argument("--reset-state", action="store_true", help="ignore prior alerts_state.json on startup")
     args = ap.parse_args()
 
-    print("=== Coinglass Heatmap Alert Runner ===")
+    print("=== Coinglass Heatmap Alert Runner (Telegram + Shock) ===")
     print(f"Watchlist: {', '.join(WATCH_COINS)} | TFs: {', '.join(TIMEFRAMES)}")
-    print(f"window=±{args.window}% | threshold=±{int(args.threshold*100)}% | interval={args.interval}s | startup={args.startup}")
-    if args.reset_state:
-        print("State: RESET (starting fresh)")
-    print("Press Ctrl-C to stop.\n")
+    print(f"window=±{args.window}% | crossing thr=±{int(args.threshold*100)}% | interval={args.interval}s | startup={args.startup}")
+    print(f"shock rules: " + ", ".join(f"{tf}: Δ≥{r['delta']:.0%} in ≤{r['minutes']}m" for tf,r in SHOCK_RULES.items()))
+    if args.reset_state: print("State: RESET")
+    print("Ctrl-C to stop.\n")
 
     state = load_state(reset=args.reset_state)
-
     try:
-        first_cycle = True
         while True:
-            lines, state = run_once(args.window, args.threshold, args.startup, state, first_cycle=first_cycle)
-            first_cycle = False
-            for ln in lines:
-                print(ln)
+            lines, state = run_once(args.window, args.threshold, args.startup, state)
+            for ln in lines: print(ln)
             save_state(state)
             time.sleep(args.interval)
     except KeyboardInterrupt:
