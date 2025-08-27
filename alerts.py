@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 Coinglass Model-2 heatmap alert runner (Telegram + Google Sheets with milestones).
-- Crossing alerts (|imbalance| >= threshold)
+- Crossing alerts at multiple thresholds (default ±30%, ±35%, ±40%)
 - Shock alerts (|Δimbalance| >= shock_delta within shock_minutes)
-- Stores short imbalance history per coin×timeframe×window in alerts_state.json
+- Stores short imbalance history per coin×timeframe×window×threshold in alerts_state.json
 - Appends one row per alert to a Google Sheet (service account or Apps Script webhook)
-- Fills %Δ price columns at 15m intervals up to 12h using batch updates (quota-friendly)
+- Fills %Δ price columns at 15m intervals up to 24h using batch updates (quota-friendly)
 - Streams terminal output continuously and caches the next free sheet row for speed.
 """
 
@@ -22,10 +22,10 @@ WATCH_COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "HYPE"]
 TIMEFRAMES  = ["12h", "24h", "72h"]
 
 DEFAULT_WINDOW_PCTS = [5.0, 6.0, 7.0]   # default: alert at ±5%, ±6%, ±7%
-DEFAULT_THRESHOLD   = 0.30              # crossing threshold (±30%)
-DEFAULT_INTERVAL_S  = 120                # 1 minute
+CROSSING_THRESHOLDS = [0.30, 0.35, 0.40]  # evaluate all of these
+DEFAULT_INTERVAL_S  = 120               # seconds between loops
 STATE_FILE          = "alerts_state.json"
-PER_REQUEST_PAUSE   = 0.5
+PER_REQUEST_PAUSE   = 0.5               # pause between API calls to be gentle
 
 # Shock rules: per-timeframe Δimb must happen within this many minutes
 SHOCK_RULES = {
@@ -36,8 +36,8 @@ SHOCK_RULES = {
 # How much history to retain (minutes). Keep comfortably above the largest window.
 MAX_HISTORY_MINUTES = max(v["minutes"] for v in SHOCK_RULES.values()) * 3
 
-# Milestone minutes: 15m .. 12h in 15m steps
-DELTA_MILESTONES_MIN = [i for i in range(15, 12*60 + 1, 15)]
+# Milestone minutes: 15m .. 24h in 15m steps
+DELTA_MILESTONES_MIN = [i for i in range(15, 24*60 + 1, 15)]
 
 # ======== ENV EXPECTED ========
 # COINGLASS_API_KEY=...
@@ -123,6 +123,22 @@ def fetch_any(currency: str, timeframe: str):
         pair = currency.upper().strip() + "USDT"
         return fetch_pair_model2_raw(pair, timeframe)
 
+# -------- formatting helpers (for nice Sheet/Telegram text) --------
+def format_direction(prev_sign, cur_sign):
+    def lab(s): return "Above" if s > 0 else ("Below" if s < 0 else "Neutral")
+    return f"{lab(prev_sign)}→{lab(cur_sign)}"
+
+def format_crossing_detail(imb, prev_sign, cur_sign, threshold):
+    return f"{imb:.2%} ({format_direction(prev_sign, cur_sign)}) ≥ {threshold:.0%}"
+
+def format_shock_detail(prev_imb, now_imb, dt_min):
+    d = abs(now_imb - prev_imb)
+    return f"{prev_imb:.2%} → {now_imb:.2%} (Δ{d:.2%} in {dt_min} min)"
+
+def window_display(window_pct):
+    # Return "6%" rather than numeric 6 to avoid 600% in Sheets percent format
+    return f"{float(window_pct):.0f}%"
+
 # ========== Data shaping ==========
 def last_close(price_candles):
     if not price_candles or len(price_candles[-1]) < 5:
@@ -182,8 +198,9 @@ def save_state(state: dict):
     except Exception:
         pass
 
-def new_alert_id(coin, tf, window_pct, ts):
-    return f"{coin}|{tf}|{int(float(window_pct))}|{int(ts)}"
+def new_alert_id(coin, tf, window_pct, ts, thr):
+    # include threshold (as integer percent) so multiple thresholds at same instant get unique IDs
+    return f"{coin}|{tf}|{int(float(window_pct))}|{int(ts)}|{int(round(thr*100))}"
 
 def record_alert_pending(state, alert_id, sheet_row, base_price, ts):
     state.setdefault("_pending", {})[alert_id] = {
@@ -266,7 +283,7 @@ def _get_sheet_handles():
         try:
             ws = sh.worksheet(tab_name)
         except Exception:
-            ws = sh.add_worksheet(title=tab_name, rows=2000, cols=max(30, len(SHEET_HEADERS)+2))
+            ws = sh.add_worksheet(title=tab_name, rows=4000, cols=max(30, len(SHEET_HEADERS)+2))
         return gc, sh, ws
     except Exception as e:
         print("[error] Sheets open failed:", e, flush=True)
@@ -346,16 +363,15 @@ def append_rows(rows) -> bool:
 def batch_fill_cells(updates):
     """
     updates: list of {"range": "H10", "values": [[0.0123]]}
-    Performs one spreadsheet.batch_update call. Requires service account.
+    Performs one batch values update via gspread Worksheet.batch_update.
     """
     gc, sh, ws = _get_sheet_handles()
-    if not sh:
+    if not ws:
         return False
     if not updates:
         return True
     try:
-        body = {"valueInputOption": "RAW", "data": updates}
-        sh.batch_update(body)
+        ws.batch_update(updates, value_input_option='RAW')
         return True
     except Exception as e:
         print("[error] Sheets batch_update failed:", e, flush=True)
@@ -375,7 +391,6 @@ def ensure_next_row_initialized(state):
         return 2
     ensure_headers_and_get_map(ws)
     last = get_last_data_row(ws)  # includes header row
-    # first data row is header+1; next empty is last+1 if last>=header
     state["_next_row"] = max(last + 1, 2)
     return state["_next_row"]
 
@@ -410,7 +425,7 @@ def cooldown_ok(last_ts_str, cooldown_min, now_ts):
     return (now_ts - last_ts) >= cooldown_min * 60
 
 # ========== Run loop ==========
-def run_once(windows, threshold, startup_mode, state):
+def run_once(windows, thresholds, startup_mode, state):
     # We'll still collect lines to return, but also print immediately.
     lines = []
     staged_rows = []   # values to append
@@ -441,102 +456,104 @@ def run_once(windows, threshold, startup_mode, state):
                     print(line, flush=True); lines.append(line)
                     continue
 
-                key = f"{coin}:{tf}:{window_pct}"
-                rec = state.get(key, {})
-                hist = rec.get("hist", [])
-                # Append current point and prune
-                hist.append([now_ts, float(imb)])
-                hist = prune_history(hist, now_ts)
+                # ---- evaluate each crossing threshold independently ----
+                for thr in thresholds:
+                    key = f"{coin}:{tf}:{window_pct}:thr={int(round(thr*100))}"
+                    rec = state.get(key, {})
+                    hist = rec.get("hist", [])
+                    # Append current point and prune
+                    hist.append([now_ts, float(imb)])
+                    hist = prune_history(hist, now_ts)
 
-                # Crossing logic
-                prev_active = bool(rec.get("active"))
-                prev_sign = int(rec.get("sign", 0))
-                active_now = abs(imb) >= threshold
-                sign_now = 1 if imb > 0 else (-1 if imb < 0 else 0)
+                    # Crossing logic for this threshold
+                    prev_active = bool(rec.get("active"))
+                    prev_sign = int(rec.get("sign", 0))
+                    active_now = abs(imb) >= thr
+                    sign_now = 1 if imb > 0 else (-1 if imb < 0 else 0)
 
-                crossed = False; reason = ""
-                if "active" not in rec:
-                    if startup_mode == "all":
-                        crossed = True; reason = "initial(all)"
-                    elif startup_mode == "over" and active_now:
-                        crossed = True; reason = "initial(over)"
-                else:
-                    crossed = active_now and (not prev_active or prev_sign != sign_now)
-                    if crossed:
-                        reason = "crossing"
+                    crossed = False; reason = ""
+                    if "active" not in rec:
+                        if startup_mode == "all":
+                            crossed = True; reason = "initial(all)"
+                        elif startup_mode == "over" and active_now:
+                            crossed = True; reason = "initial(over)"
+                    else:
+                        crossed = active_now and (not prev_active or prev_sign != sign_now)
+                        if crossed:
+                            reason = "crossing"
 
-                # Shock logic
-                is_shock, prev_imb, dt_min = detect_shock(tf, hist[:-1], imb, now_ts)
-                shock_ok = False
-                if is_shock:
-                    rule = SHOCK_RULES[tf]
-                    shock_ok = cooldown_ok(rec.get("last_shock_alert_utc"), rule["cooldown_min"], now_ts)
+                    # Shock logic (shared values are cheap to recompute)
+                    is_shock, prev_imb, dt_min = detect_shock(tf, hist[:-1], imb, now_ts)
+                    shock_ok = False
+                    if is_shock:
+                        rule = SHOCK_RULES[tf]
+                        shock_ok = cooldown_ok(rec.get("last_shock_alert_utc"), rule["cooldown_min"], now_ts)
 
-                status = "OK "
-                # Build messages + stage a sheet row
-                if crossed or (is_shock and shock_ok):
-                    direction = "Above→Below" if imb > 0 else "Below→Above"
-                    parts = [f"<b>Heatmap Alert</b> {coin} • {tf} • ±{float(window_pct):.0f}% window"]
-                    if crossed:
-                        parts.append(f"Crossing: <b>{imb:.2%}</b> ({direction}) ≥ {threshold:.0%}")
-                    if is_shock and shock_ok:
-                        d = abs(imb - prev_imb)
-                        parts.append(f"⚡ Shock: {prev_imb:.2%} → {imb:.2%} (Δ{d:.2%} in {dt_min} min)")
-                    parts += [
-                        f"Above: ${ta:,.0f} • Below: ${tb:,.0f}",
-                        f"Current price: ${price:,.2f}",
-                        f"Source: {source}",
-                        f"Params: {params}",
-                        f"UTC: {utc_now}",
-                        f"Note: {reason}" if reason else "",
-                    ]
-                    text = "\n".join(p for p in parts if p)
-                    sent = send_telegram(text)
-                    status += "📣" if sent else "📣✗"
+                    # Build messages + stage a sheet row
+                    if crossed or (is_shock and shock_ok):
+                        parts = [f"<b>Heatmap Alert</b> {coin} • {tf} • ±{float(window_pct):.0f}% window • thr=±{int(thr*100)}%"]
 
-                    # Stage a row matching headers (Date, Time, Coin, Price, Timeframe, Window, Alert, %Δ cols...)
-                    alert_dt = utc_now_dt  # already UTC
-                    date_str = alert_dt.strftime("%Y-%m-%d")
-                    time_str = alert_dt.strftime("%H:%M:%S")
-                    alert_type = []
-                    if crossed: alert_type.append("crossing")
-                    if is_shock and shock_ok: alert_type.append("shock")
-                    alert_label = " & ".join(alert_type) or "info"
+                        detail_bits = []
+                        if crossed:
+                            detail_bits.append("crossing: " + format_crossing_detail(imb, prev_sign, sign_now, thr))
+                            parts.append("Crossing: <b>" + format_crossing_detail(imb, prev_sign, sign_now, thr) + "</b>")
+                        if is_shock and shock_ok:
+                            detail_bits.append("shock: " + format_shock_detail(prev_imb, imb, dt_min))
+                            parts.append("⚡ Shock: " + format_shock_detail(prev_imb, imb, dt_min))
 
-                    row_values = [date_str, time_str, coin, round(price, 4), tf, float(window_pct), alert_label] + \
-                                 [""] * len(DELTA_MILESTONES_MIN)
-                    staged_rows.append(row_values)
+                        parts += [
+                            f"Above: ${ta:,.0f} • Below: ${tb:,.0f}",
+                            f"Current price: ${price:,.2f}",
+                            f"Source: {source}",
+                            f"Params: {params}",
+                            f"UTC: {utc_now}",
+                            f"Note: {reason}" if reason else "",
+                        ]
+                        text = "\n".join(p for p in parts if p)
+                        sent = send_telegram(text)
+                        status = "OK " + ("📣" if sent else "📣✗")
 
-                    aid = new_alert_id(coin, tf, window_pct, now_ts)
-                    staged_meta.append({
-                        "aid": aid,
-                        "coin": coin,
-                        "base_price": price,
-                        "ts": now_ts
+                        # Stage a row matching headers (Date, Time, Coin, Price, Timeframe, Window, Alert, %Δ cols...)
+                        alert_dt = utc_now_dt  # already UTC
+                        date_str = alert_dt.strftime("%Y-%m-%d")
+                        time_str = alert_dt.strftime("%H:%M:%S")
+                        alert_label = " | ".join(detail_bits) if detail_bits else "info"
+
+                        row_values = [date_str, time_str, coin, round(price, 4), tf,
+                                      window_display(window_pct),
+                                      f"thr=±{int(thr*100)}% • {alert_label}"] + \
+                                     [""] * len(DELTA_MILESTONES_MIN)
+                        staged_rows.append(row_values)
+
+                        aid = new_alert_id(coin, tf, window_pct, now_ts, thr)
+                        staged_meta.append({
+                            "aid": aid,
+                            "coin": coin,
+                            "base_price": price,
+                            "ts": now_ts
+                        })
+
+                    # Print per-threshold line immediately
+                    line = (
+                        f"{utc_now} | {coin:<5} {tf:<4} | win=±{float(window_pct):.0f}% | thr=±{int(thr*100)}% | "
+                        f"imb={imb:>+6.2%} | above=${ta:>12,.0f} | below=${tb:>12,.0f}"
+                    )
+                    print(line, flush=True); lines.append(line)
+
+                    # Update state for this threshold
+                    rec.update({
+                        "active": active_now,
+                        "sign": sign_now,
+                        "last_imbalance": float(imb),
+                        "last_checked_utc": now_utc().isoformat(),
+                        "hist": hist,
                     })
-
-                # Print line immediately
-                line = (
-                    f"{utc_now} | {coin:<5} {tf:<4} | win=±{float(window_pct):.0f}% | "
-                    f"imb={imb:>+6.2%} | above=${ta:>12,.0f} | below=${tb:>12,.0f} | {status}"
-                )
-                print(line, flush=True); lines.append(line)
-
-                # Update state record
-                rec.update({
-                    "active": active_now,
-                    "sign": sign_now,
-                    "last_imbalance": float(imb),
-                    "last_checked_utc": now_utc().isoformat(),
-                    "hist": hist,
-                })
-                if is_shock and shock_ok:
-                    rec["last_shock_alert_utc"] = now_utc().isoformat()
-                state[key] = rec
+                    if is_shock and shock_ok:
+                        rec["last_shock_alert_utc"] = now_utc().isoformat()
+                    state[key] = rec
 
     # ===== Append staged alert rows (once per tick) and record row numbers using cached _next_row =====
     if staged_rows:
-        # Ensure _next_row is initialized once (no per-loop scanning)
         start_row = ensure_next_row_initialized(state)  # first row we'll write to
         ok = append_rows(staged_rows)
         if not ok:
@@ -570,7 +587,7 @@ def run_once(windows, threshold, startup_mode, state):
 
             for aid, rec in list(pending.items()):
                 try:
-                    coin_i, tf_i, win_i, ts_i = aid.split("|")
+                    coin_i, tf_i, win_i, ts_i, thr_i = aid.split("|")
                 except ValueError:
                     continue
                 base = rec["base_price"]
@@ -621,16 +638,35 @@ def parse_windows(args):
         return [float(args.window)]
     return DEFAULT_WINDOW_PCTS
 
+def parse_thresholds(args):
+    # priority: --thresholds (comma list) > --threshold (single) > defaults list
+    if getattr(args, "thresholds", None):
+        out = []
+        for t in args.thresholds.split(","):
+            t = t.strip()
+            if not t:
+                continue
+            try:
+                out.append(float(t))
+            except ValueError:
+                pass
+        return out or CROSSING_THRESHOLDS
+    if getattr(args, "threshold", None) is not None:
+        return [float(args.threshold)]
+    return CROSSING_THRESHOLDS
+
 def main():
-    ap = argparse.ArgumentParser(description="Coinglass Heatmap Alert Runner (Telegram + Shock + Sheets + Milestones)")
+    ap = argparse.ArgumentParser(description="Coinglass Heatmap Alert Runner (Telegram + Shock + Sheets + Milestones, multi-threshold)")
     ap.add_argument("--windows", type=str,
                     help='comma-separated window percents to evaluate, e.g. "5,6,7" (default uses 5,6,7)')
     ap.add_argument("--window", type=float,
                     help="single window percent (deprecated convenience; overrides defaults if provided)")
-    ap.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
-                    help="crossing threshold (0.30=30%%)")
+    ap.add_argument("--thresholds", type=str,
+                    help='comma-separated crossing thresholds as fractions, e.g. "0.30,0.35,0.40"')
+    ap.add_argument("--threshold", type=float, default=None,
+                    help="single crossing threshold (fraction), e.g. 0.30; overrides defaults if provided")
     ap.add_argument("--interval", type=int, default=DEFAULT_INTERVAL_S,
-                    help="seconds between checks (default 60)")
+                    help="seconds between checks")
     ap.add_argument("--startup", choices=["over","all","none"], default="over",
                     help="first run: 'over' (alert if already ≥ thr), 'all' (alert everything once), 'none'")
     ap.add_argument("--reset-state", action="store_true",
@@ -638,11 +674,13 @@ def main():
     args = ap.parse_args()
 
     windows = parse_windows(args)
+    thresholds = parse_thresholds(args)
 
     print("=== Coinglass Heatmap Alert Runner (Telegram + Shock + Sheets + Milestones) ===", flush=True)
     print(f"Watchlist: {', '.join(WATCH_COINS)} | TFs: {', '.join(TIMEFRAMES)} | Windows: " +
           ", ".join(f"±{w:.0f}%" for w in windows), flush=True)
-    print(f"crossing thr=±{int(args.threshold*100)}% | interval={args.interval}s | startup={args.startup}", flush=True)
+    print(f"crossing thr(s)={', '.join(f'±{int(t*100)}%' for t in thresholds)} | "
+          f"interval={args.interval}s | startup={args.startup}", flush=True)
     print("shock rules: " + ", ".join(f"{tf}: Δ≥{r['delta']:.0%} in ≤{r['minutes']}m (cooldown {r['cooldown_min']}m)"
                                       for tf,r in SHOCK_RULES.items()), flush=True)
     if args.reset_state:
@@ -657,7 +695,7 @@ def main():
 
     try:
         while True:
-            lines, state = run_once(windows, args.threshold, args.startup, state)
+            _, state = run_once(windows, thresholds, args.startup, state)
             save_state(state)
             time.sleep(args.interval)
     except KeyboardInterrupt:
