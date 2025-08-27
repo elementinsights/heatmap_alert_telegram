@@ -20,15 +20,15 @@ TIMEFRAMES  = ["12h", "24h", "72h"]
 
 DEFAULT_WINDOW_PCT  = 5.0
 DEFAULT_THRESHOLD   = 0.30      # crossing threshold (±30%)
-DEFAULT_INTERVAL_S  = 120
+DEFAULT_INTERVAL_S  = 60       # 2 minutes
 STATE_FILE          = "alerts_state.json"
 PER_REQUEST_PAUSE   = 0.5
 
 # Shock rules: per-timeframe Δimb must happen within this many minutes
 SHOCK_RULES = {
-    "12h": {"delta": 0.30, "minutes": 15,  "cooldown_min": 15},
-    "24h": {"delta": 0.30, "minutes": 120, "cooldown_min": 60},
-    "72h": {"delta": 0.30, "minutes": 360, "cooldown_min": 180},
+    "12h": {"delta": 0.30, "minutes": 15,  "cooldown_min": 0},
+    "24h": {"delta": 0.30, "minutes": 120, "cooldown_min": 0},
+    "72h": {"delta": 0.30, "minutes": 360, "cooldown_min": 0},
 }
 # How much history to retain (minutes). Keep comfortably above the largest window.
 MAX_HISTORY_MINUTES = max(v["minutes"] for v in SHOCK_RULES.values()) * 3
@@ -178,7 +178,7 @@ def send_telegram(text: str) -> bool:
 def prune_history(hist, now_ts):
     """Keep only recent history needed for shock checks."""
     keep_seconds = MAX_HISTORY_MINUTES * 60
-    return [pt for pt in hist if now_ts - pt[0] <= keep_seconds][-500:]  # also cap length
+    return [pt for pt in hist if now_ts - pt[0] <= keep_seconds][-500:]
 
 def detect_shock(tf, hist, now_imb, now_ts):
     """Return (is_shock, prev_imb, dt_minutes) based on SHOCK_RULES[tf]."""
@@ -186,7 +186,6 @@ def detect_shock(tf, hist, now_imb, now_ts):
     if not rule: return (False, None, None)
     window = rule["minutes"] * 60
     delta_needed = rule["delta"]
-    # Walk backwards through history inside the window
     for ts, prev_imb in reversed(hist):
         dt_sec = now_ts - ts
         if dt_sec > window:
@@ -216,8 +215,10 @@ def run_once(window_pct, threshold, startup_mode, state):
                 data, params, source = fetch_any(coin, tf)
                 time.sleep(PER_REQUEST_PAUSE)
                 price = last_close(data.get("price_candlesticks", []))
-                levels = aggregate_totals_by_level(data.get("y_axis", []),
-                                                   data.get("liquidation_leverage_data", []))
+                levels = aggregate_totals_by_level(
+                    data.get("y_axis", []),
+                    data.get("liquidation_leverage_data", [])
+                )
                 below, above = split_window(levels, price, window_pct)
                 imb, ta, tb = imbalance(below, above)
             except Exception as e:
@@ -231,7 +232,7 @@ def run_once(window_pct, threshold, startup_mode, state):
             hist.append([now_ts, float(imb)])
             hist = prune_history(hist, now_ts)
 
-            # Crossing logic (unchanged)
+            # Crossing logic
             prev_active = bool(rec.get("active"))
             prev_sign = int(rec.get("sign", 0))
             active_now = abs(imb) >= threshold
@@ -263,11 +264,12 @@ def run_once(window_pct, threshold, startup_mode, state):
                     parts.append(f"Crossing: <b>{imb:.2%}</b> ({direction}) ≥ {threshold:.0%}")
                 if is_shock and shock_ok:
                     d = abs(imb - prev_imb)
-                    parts.append(f"⚡ Shock: Δ{d:.2%} in {dt_min} min (from {prev_imb:.2%})")
+                    # Show previous and current explicitly (no leading + on positives)
+                    parts.append(f"⚡ Shock: {prev_imb:.2%} → {imb:.2%} (Δ{d:.2%} in {dt_min} min)")
                 parts += [
                     f"Window: ±{window_pct}%",
                     f"Above: ${ta:,.0f} • Below: ${tb:,.0f}",
-                    f"Last price: ${price:,.2f}",
+                    f"Current price: ${price:,.2f}",
                     f"Source: {source}",
                     f"Params: {params}",
                     f"UTC: {utc_now}",
@@ -277,8 +279,10 @@ def run_once(window_pct, threshold, startup_mode, state):
                 sent = send_telegram(text)
                 status += "📣" if sent else "📣✗"
 
-            lines.append(f"{utc_now} | {coin:<5} {tf:<4} | imb={imb:>+6.2%} | "
-                         f"above=${ta:>12,.0f} | below=${tb:>12,.0f} | {status}")
+            lines.append(
+                f"{utc_now} | {coin:<5} {tf:<4} | imb={imb:>+6.2%} | "
+                f"above=${ta:>12,.0f} | below=${tb:>12,.0f} | {status}"
+            )
 
             # Update state
             rec.update({
@@ -296,18 +300,22 @@ def run_once(window_pct, threshold, startup_mode, state):
 
 def main():
     ap = argparse.ArgumentParser(description="Coinglass Heatmap Alert Runner (Telegram + Shock)")
-    ap.add_argument("--window", type=float, default=DEFAULT_WINDOW_PCT, help="±window percent (default 5.0)")
-    ap.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help="crossing threshold (0.30=30%%)")
-    ap.add_argument("--interval", type=int, default=DEFAULT_INTERVAL_S, help="seconds between checks (default 300)")
+    ap.add_argument("--window", type=float, default=DEFAULT_WINDOW_PCT,
+                    help="±window percent (default 5.0)")
+    ap.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
+                    help="crossing threshold (0.30=30%%)")
+    ap.add_argument("--interval", type=int, default=DEFAULT_INTERVAL_S,
+                    help="seconds between checks (default 120)")
     ap.add_argument("--startup", choices=["over","all","none"], default="over",
                     help="first run: 'over' (alert if already ≥ thr), 'all' (alert everything once), 'none'")
-    ap.add_argument("--reset-state", action="store_true", help="ignore prior alerts_state.json on startup")
+    ap.add_argument("--reset-state", action="store_true",
+                    help="ignore prior alerts_state.json on startup")
     args = ap.parse_args()
 
     print("=== Coinglass Heatmap Alert Runner (Telegram + Shock) ===")
     print(f"Watchlist: {', '.join(WATCH_COINS)} | TFs: {', '.join(TIMEFRAMES)}")
     print(f"window=±{args.window}% | crossing thr=±{int(args.threshold*100)}% | interval={args.interval}s | startup={args.startup}")
-    print(f"shock rules: " + ", ".join(f"{tf}: Δ≥{r['delta']:.0%} in ≤{r['minutes']}m" for tf,r in SHOCK_RULES.items()))
+    print("shock rules: " + ", ".join(f"{tf}: Δ≥{r['delta']:.0%} in ≤{r['minutes']}m" for tf,r in SHOCK_RULES.items()))
     if args.reset_state: print("State: RESET")
     print("Ctrl-C to stop.\n")
 
