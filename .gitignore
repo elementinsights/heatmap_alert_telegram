@@ -1,0 +1,60 @@
+# --- OS cruft ---
+.DS_Store
+Thumbs.db
+
+# --- Python bytecode / caches ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.dylib
+*.egg
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.pytype/
+.pyre/
+.ruff_cache/
+.dmypy.json
+.cache/
+
+# --- Packaging / builds ---
+build/
+dist/
+wheels/
+pip-wheel-metadata/
+
+# --- Coverage / test artifacts ---
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# --- Virtual environments ---
+venv/
+.venv/
+ENV/
+env/
+.python-version
+
+# --- IDE settings ---
+.idea/
+.vscode/
+*.iml
+
+# --- Logs & runtime state ---
+*.log
+alerts_state.json
+alerts.log
+
+# --- Secrets / environment files ---
+.env
+.env.*
+*.env
+# Streamlit secrets (if you use the UI app too)
+.streamlit/secrets.toml
+
+# --- Misc backups ---
+*~
