@@ -1,18 +1,42 @@
 #!/usr/bin/env python3
 """
 Coinglass Model-2 heatmap alert runner (Telegram + Google Sheets with milestones).
-- Crossing alerts at multiple thresholds (default ±30%, ±35%, ±40%)
-- Shock alerts (|Δimbalance| >= shock_delta within shock_minutes) — ONE per coin×tf×window (not per threshold)
-- Stores short imbalance history per coin×timeframe×window×threshold in alerts_state.json
-- Appends one row per alert to a Google Sheet (service account or Apps Script webhook)
-- Fills %Δ price columns at custom milestones:
-    1m,2m,3m,4m,5m,10m,15m, then every 15m (30m,45m,...) up to 24h
-- Streams terminal output continuously and caches the next free sheet row for speed.
+
+What’s new vs your originals:
+- One runner evaluates ALL crossing thresholds (default: ±30, ±35, ±40) after a single API fetch.
+- One runner evaluates ALL shock levels (default: Δ≥30/35/40%) in the given time windows.
+  • Escalates immediately when a higher level is hit (e.g., from 30% to 35%).
+  • Respects cooldowns when re-alerting at the same level.
+
+Other features kept:
+- Keeps short imbalance histories per coin×timeframe×window×threshold (crossings) and per coin×timeframe×window (shock).
+- Appends one row per alert to Google Sheets.
+- Fills %Δ price at milestones (1m,2m,3m,4m,5m,10m,15m, then every 15m up to 24h).
+- Streams terminal output and caches the next free sheet row.
+
+ENV expected:
+  COINGLASS_API_KEY
+  TELEGRAM_BOT_TOKEN
+  TELEGRAM_CHAT_ID (or TELEGRAM_CHANNEL)
+  ALERT_TAG (optional, prepended to every Telegram message)
+  GOOGLE_SHEETS_ID
+  GOOGLE_SHEETS_TAB (optional; default 'Alerts')
+  GOOGLE_SA_JSON (path to service account json)
+  GSHEET_WEBHOOK_URL (optional fallback for appends)
+  CROSSING_ENABLED=true/false (optional; default true)
+  SHOCK_ENABLED=true/false (optional; default true)
 """
 
 import os, json, math, time, argparse, requests, datetime as dt
 from collections import defaultdict
 from dotenv import load_dotenv
+
+# load .env EARLY so env vars exist for the feature flags
+load_dotenv(override=True)
+
+# Feature toggles (env)
+SHOCK_ENABLED = os.getenv("SHOCK_ENABLED", "true").strip().lower() in ("1","true","yes","on")
+CROSSING_ENABLED = os.getenv("CROSSING_ENABLED", "true").strip().lower() in ("1","true","yes","on")
 
 # ========== CONFIG ==========
 API_HOST = "https://open-api-v4.coinglass.com"
@@ -22,35 +46,34 @@ PAIR_ENDPOINT = "/api/futures/liquidation/heatmap/model2"
 WATCH_COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
 TIMEFRAMES  = ["12h", "24h", "72h"]
 
-DEFAULT_WINDOW_PCTS = [5.0]      # alert windows ±5%, ±6%, ±7%
-CROSSING_THRESHOLDS = [0.30]   # evaluate all of these
-DEFAULT_INTERVAL_S  = 120                  # seconds between loops
-STATE_FILE          = "alerts_state.json"
-PER_REQUEST_PAUSE   = 0.5                  # pause between API calls
+# Windows around price to sum liq levels
+DEFAULT_WINDOW_PCTS = [5.0]  # e.g. ±5%
 
-# Shock rules: per-timeframe Δimb must happen within this many minutes
+# Crossing thresholds (abs(imbalance) >= threshold)
+CROSSING_THRESHOLDS = [0.30, 0.35, 0.40]
+
+# Shock: change in imbalance within a lookback window (minutes)
+# Minutes/cooldowns per timeframe:
 SHOCK_RULES = {
-    "12h": {"delta": 0.30, "minutes": 15,  "cooldown_min": 5},
-    "24h": {"delta": 0.30, "minutes": 120, "cooldown_min": 10},
-    "72h": {"delta": 0.30, "minutes": 360, "cooldown_min": 15},
+    "12h": {"minutes": 15,  "cooldown_min": 5},
+    "24h": {"minutes": 120, "cooldown_min": 10},
+    "72h": {"minutes": 360, "cooldown_min": 15},
 }
-# How much history to retain (minutes). Keep comfortably above the largest window.
+# Multi-level shock deltas we evaluate simultaneously (Δ≥level)
+SHOCK_LEVELS = [0.30]
+
+DEFAULT_INTERVAL_S  = 60          # seconds between loops
+STATE_FILE          = "alerts_state.json"
+PER_REQUEST_PAUSE   = 0.5         # pause between API calls (politeness)
+
+# How much history to retain (minutes)—keep above the largest shock window
 MAX_HISTORY_MINUTES = max(v["minutes"] for v in SHOCK_RULES.values()) * 3
 
 # Milestones: 1,2,3,4,5,10,15, then every 15m from 30m to 24h
 EARLY_MINUTES = [1, 2, 3, 4, 5, 10, 15]
 DELTA_MILESTONES_MIN = EARLY_MINUTES + [i for i in range(30, 24*60 + 1, 15)]
 
-# ======== ENV EXPECTED ========
-# COINGLASS_API_KEY=...
-# TELEGRAM_BOT_TOKEN=...
-# TELEGRAM_CHAT_ID=...  (or TELEGRAM_CHANNEL)
-# GOOGLE_SHEETS_ID=...  (spreadsheet id)
-# GOOGLE_SHEETS_TAB=Alerts  (optional; default Alerts)
-# GOOGLE_SA_JSON=service_account.json  (path to GCP service account key)
-# GSHEET_WEBHOOK_URL=https://script.google.com/... (optional fallback for appends)
-
-# ========== Helpers ==========
+# ======== Helpers ========
 def now_utc() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
@@ -199,10 +222,13 @@ def save_state(state: dict):
     except Exception:
         pass
 
-def new_alert_id(coin, tf, window_pct, ts, thr=None):
-    # if thr is None -> shock id; else include threshold
+def new_alert_id(coin, tf, window_pct, ts, thr=None, shock_level=None):
     base = f"{coin}|{tf}|{int(float(window_pct))}|{int(ts)}"
-    return base if thr is None else f"{base}|{int(round(thr*100))}"
+    if thr is not None:
+        return f"{base}|thr{int(round(thr*100))}"
+    if shock_level is not None:
+        return f"{base}|shock{int(round(shock_level*100))}"
+    return base
 
 def record_alert_pending(state, alert_id, sheet_row, base_price, ts):
     state.setdefault("_pending", {})[alert_id] = {
@@ -226,9 +252,15 @@ def send_telegram(text: str) -> bool:
     load_dotenv()
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("TELEGRAM_CHANNEL")
+    tag = os.getenv("ALERT_TAG", "").strip()
+
+    if tag:
+        text = f"{tag} {text}"   # prepend tag to every message
+
     if not (token and chat_id):
         print("[warn] Telegram not sent: missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID", flush=True)
         return False
+
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     try:
@@ -363,24 +395,27 @@ def ensure_next_row_initialized(state):
     state["_next_row"] = max(last + 1, 2)
     return state["_next_row"]
 
-# ========== Shock detection ==========
+# ========== Shock detection (multi-level) ==========
 def prune_history(hist, now_ts):
     keep_seconds = MAX_HISTORY_MINUTES * 60
     return [pt for pt in hist if now_ts - pt[0] <= keep_seconds][-500:]
 
-def detect_shock(tf, hist, now_imb, now_ts):
+def detect_shock(tf, hist, now_imb, now_ts, levels):
+    """Return (level, prev_imb, dt_min) for the HIGHEST level satisfied within the tf window, else (None, None, None)."""
     rule = SHOCK_RULES.get(tf)
     if not rule:
-        return (False, None, None)
+        return (None, None, None)
     window = rule["minutes"] * 60
-    delta_needed = rule["delta"]
+    best = (None, None, None)
     for ts, prev_imb in reversed(hist):
         dt_sec = now_ts - ts
         if dt_sec > window:
             break
-        if abs(now_imb - prev_imb) >= delta_needed:
-            return True, prev_imb, round(dt_sec / 60, 1)
-    return False, None, None
+        diff = abs(now_imb - prev_imb)
+        lvl = max((L for L in levels if diff >= L), default=None)
+        if lvl is not None and (best[0] is None or lvl > best[0]):
+            best = (lvl, prev_imb, round(dt_sec / 60, 1))
+    return best
 
 def cooldown_ok(last_ts_str, cooldown_min, now_ts):
     if not last_ts_str:
@@ -422,114 +457,121 @@ def run_once(windows, thresholds, startup_mode, state):
                     print(line, flush=True); lines.append(line)
                     continue
 
-                # ---------- SINGLE shock evaluation per (coin, tf, window) ----------
-                shock_key = f"{coin}:{tf}:{window_pct}:shock"
-                shock_rec = state.get(shock_key, {})
-                shock_hist = shock_rec.get("hist", [])
-                shock_hist.append([now_ts, float(imb)])
-                shock_hist = prune_history(shock_hist, now_ts)
+                # ---------- MULTI-LEVEL SHOCK (one state per coin×tf×window) ----------
+                if SHOCK_ENABLED:
+                    shock_key = f"{coin}:{tf}:{window_pct}:shock"
+                    shock_rec = state.get(shock_key, {})
+                    shock_hist = shock_rec.get("hist", [])
+                    shock_hist.append([now_ts, float(imb)])
+                    shock_hist = prune_history(shock_hist, now_ts)
 
-                is_shock, prev_imb, dt_min = detect_shock(tf, shock_hist[:-1], imb, now_ts)
-                shock_ok = False
-                if is_shock:
+                    level, prev_imb, dt_min = detect_shock(tf, shock_hist[:-1], imb, now_ts, SHOCK_LEVELS)
                     rule = SHOCK_RULES[tf]
-                    shock_ok = cooldown_ok(shock_rec.get("last_shock_alert_utc"), rule["cooldown_min"], now_ts)
+                    last_level = float(shock_rec.get("last_level", 0.0))
+                    last_any_utc = shock_rec.get("last_any_utc")
 
-                if is_shock and shock_ok:
-                    parts = [f"<b>Heatmap Alert</b> {coin} • {tf} • ±{float(window_pct):.0f}% window"]
-                    parts.append("⚡ Shock: " + format_shock_detail(prev_imb, imb, dt_min))
-                    parts += [
-                        f"Above: ${ta:,.0f} • Below: ${tb:,.0f}",
-                        f"Current price: ${price:,.2f}",
-                        f"Source: {source}",
-                        f"Params: {params}",
-                        f"UTC: {utc_now}",
-                    ]
-                    text = "\n".join(parts)
-                    sent = send_telegram(text)
+                    should_alert = False
+                    if level is not None:
+                        if level > last_level:
+                            should_alert = True  # escalate immediately
+                        elif cooldown_ok(last_any_utc, rule["cooldown_min"], now_ts):
+                            should_alert = True  # same-level re-alert after cooldown
 
-                    # Sheet row for shock (no thr)
-                    date_str = utc_now_dt.strftime("%Y-%m-%d")
-                    time_str = utc_now_dt.strftime("%H:%M:%S")
-                    row_values = [date_str, time_str, coin, round(price, 4), tf,
-                                  window_display(window_pct),
-                                  "shock: " + format_shock_detail(prev_imb, imb, dt_min)] + \
-                                 [""] * len(DELTA_MILESTONES_MIN)
-                    staged_rows.append(row_values)
-
-                    aid = new_alert_id(coin, tf, window_pct, now_ts, thr=None)  # shock id
-                    staged_meta.append({"aid": aid, "coin": coin, "base_price": price, "ts": now_ts})
-
-                    shock_rec["last_shock_alert_utc"] = now_utc().isoformat()
-
-                # Persist shock hist every loop
-                shock_rec.update({"hist": shock_hist, "last_checked_utc": now_utc().isoformat()})
-                state[shock_key] = shock_rec
-
-                # ---------- Crossing evaluation per threshold ----------
-                for thr in thresholds:
-                    key = f"{coin}:{tf}:{window_pct}:thr={int(round(thr*100))}"
-                    rec = state.get(key, {})
-                    hist = rec.get("hist", [])
-                    hist.append([now_ts, float(imb)])
-                    hist = prune_history(hist, now_ts)
-
-                    prev_active = bool(rec.get("active"))
-                    prev_sign = int(rec.get("sign", 0))
-                    active_now = abs(imb) >= thr
-                    sign_now = 1 if imb > 0 else (-1 if imb < 0 else 0)
-
-                    crossed = False; reason = ""
-                    if "active" not in rec:
-                        if startup_mode == "all":
-                            crossed = True; reason = "initial(all)"
-                        elif startup_mode == "over" and active_now:
-                            crossed = True; reason = "initial(over)"
-                    else:
-                        crossed = active_now and (not prev_active or prev_sign != sign_now)
-                        if crossed: reason = "crossing"
-
-                    if crossed:
-                        parts = [f"<b>Heatmap Alert</b> {coin} • {tf} • ±{float(window_pct):.0f}% window • thr=±{int(thr*100)}%"]
-                        parts.append("Crossing: <b>" + format_crossing_detail(imb, prev_sign, sign_now, thr) + "</b>")
+                    if level is not None and should_alert:
+                        parts = [f"<b>Heatmap Alert</b> {coin} • {tf} • ±{float(window_pct):.0f}% window"]
+                        parts.append("⚡ Shock Δ≥" + f"{int(level*100)}%: " + format_shock_detail(prev_imb, imb, dt_min))
                         parts += [
                             f"Above: ${ta:,.0f} • Below: ${tb:,.0f}",
                             f"Current price: ${price:,.2f}",
                             f"Source: {source}",
                             f"Params: {params}",
                             f"UTC: {utc_now}",
-                            f"Note: {reason}" if reason else "",
                         ]
-                        text = "\n".join(parts)
-                        sent = send_telegram(text)
+                        send_telegram("\n".join(parts))
 
+                        # Sheet row for shock (include level)
                         date_str = utc_now_dt.strftime("%Y-%m-%d")
                         time_str = utc_now_dt.strftime("%H:%M:%S")
-                        alert_label = "crossing: " + format_crossing_detail(imb, prev_sign, sign_now, thr)
                         row_values = [date_str, time_str, coin, round(price, 4), tf,
                                       window_display(window_pct),
-                                      f"thr=±{int(thr*100)}% • {alert_label}"] + \
+                                      f"shock Δ≥{int(level*100)}%: " + format_shock_detail(prev_imb, imb, dt_min)] + \
                                      [""] * len(DELTA_MILESTONES_MIN)
                         staged_rows.append(row_values)
 
-                        aid = new_alert_id(coin, tf, window_pct, now_ts, thr)
+                        aid = new_alert_id(coin, tf, window_pct, now_ts, shock_level=level)
                         staged_meta.append({"aid": aid, "coin": coin, "base_price": price, "ts": now_ts})
 
-                    # Print per-threshold status
-                    line = (
-                        f"{utc_now} | {coin:<5} {tf:<4} | win=±{float(window_pct):.0f}% | thr=±{int(thr*100)}% | "
-                        f"imb={imb:>+6.2%} | above=${ta:>12,.0f} | below=${tb:>12,.0f}"
-                    )
-                    print(line, flush=True); lines.append(line)
+                        shock_rec["last_level"] = float(level)
+                        shock_rec["last_any_utc"] = now_utc().isoformat()
 
-                    rec.update({
-                        "active": active_now,
-                        "sign": sign_now,
-                        "last_imbalance": float(imb),
-                        "last_checked_utc": now_utc().isoformat(),
-                        "hist": hist,
-                    })
-                    state[key] = rec
+                    # Persist shock hist every loop
+                    shock_rec.update({"hist": shock_hist, "last_checked_utc": now_utc().isoformat()})
+                    state[shock_key] = shock_rec
+
+                # ---------- MULTI-THRESHOLD CROSSINGS ----------
+                if CROSSING_ENABLED:
+                    for thr in thresholds:
+                        key = f"{coin}:{tf}:{window_pct}:thr={int(round(thr*100))}"
+                        rec = state.get(key, {})
+                        hist = rec.get("hist", [])
+                        hist.append([now_ts, float(imb)])
+                        hist = prune_history(hist, now_ts)
+
+                        prev_active = bool(rec.get("active"))
+                        prev_sign = int(rec.get("sign", 0))
+                        active_now = abs(imb) >= thr
+                        sign_now = 1 if imb > 0 else (-1 if imb < 0 else 0)
+
+                        crossed = False; reason = ""
+                        if "active" not in rec:
+                            if startup_mode == "all":
+                                crossed = True; reason = "initial(all)"
+                            elif startup_mode == "over" and active_now:
+                                crossed = True; reason = "initial(over)"
+                        else:
+                            crossed = active_now and (not prev_active or prev_sign != sign_now)
+                            if crossed: reason = "crossing"
+
+                        if crossed:
+                            parts = [f"<b>Heatmap Alert</b> {coin} • {tf} • ±{float(window_pct):.0f}% window • thr=±{int(thr*100)}%"]
+                            parts.append("Crossing: <b>" + format_crossing_detail(imb, prev_sign, sign_now, thr) + "</b>")
+                            parts += [
+                                f"Above: ${ta:,.0f} • Below: ${tb:,.0f}",
+                                f"Current price: ${price:,.2f}",
+                                f"Source: {source}",
+                                f"Params: {params}",
+                                f"UTC: {utc_now}",
+                                f"Note: {reason}" if reason else "",
+                            ]
+                            send_telegram("\n".join(parts))
+
+                            date_str = utc_now_dt.strftime("%Y-%m-%d")
+                            time_str = utc_now_dt.strftime("%H:%M:%S")
+                            alert_label = "crossing: " + format_crossing_detail(imb, prev_sign, sign_now, thr)
+                            row_values = [date_str, time_str, coin, round(price, 4), tf,
+                                          window_display(window_pct),
+                                          f"thr=±{int(thr*100)}% • {alert_label}"] + \
+                                         [""] * len(DELTA_MILESTONES_MIN)
+                            staged_rows.append(row_values)
+
+                            aid = new_alert_id(coin, tf, window_pct, now_ts, thr=thr)
+                            staged_meta.append({"aid": aid, "coin": coin, "base_price": price, "ts": now_ts})
+
+                        # Per-threshold status line
+                        line = (
+                            f"{utc_now} | {coin:<5} {tf:<4} | win=±{float(window_pct):.0f}% | thr=±{int(thr*100)}% | "
+                            f"imb={imb:>+6.2%} | above=${ta:>12,.0f} | below=${tb:>12,.0f}"
+                        )
+                        print(line, flush=True); lines.append(line)
+
+                        rec.update({
+                            "active": active_now,
+                            "sign": sign_now,
+                            "last_imbalance": float(imb),
+                            "last_checked_utc": now_utc().isoformat(),
+                            "hist": hist,
+                        })
+                        state[key] = rec
 
     # ===== Append staged rows & register milestones =====
     if staged_rows:
@@ -561,7 +603,7 @@ def run_once(windows, thresholds, startup_mode, state):
 
             for aid, rec in list(pending.items()):
                 try:
-                    parts = aid.split("|")  # shock ids have 4 parts; crossing have 5
+                    parts = aid.split("|")
                     coin_i = parts[0]
                 except Exception:
                     continue
@@ -622,12 +664,24 @@ def parse_thresholds(args):
         return [float(args.threshold)]
     return CROSSING_THRESHOLDS
 
+def parse_shock_levels(args):
+    if getattr(args, "shock_levels", None):
+        out = []
+        for s in args.shock_levels.split(","):
+            s = s.strip()
+            if not s: continue
+            try: out.append(float(s))
+            except ValueError: pass
+        return out or SHOCK_LEVELS
+    return SHOCK_LEVELS
+
 def main():
-    ap = argparse.ArgumentParser(description="Coinglass Heatmap Alert Runner (Telegram + Shock + Sheets + Milestones, multi-threshold)")
+    ap = argparse.ArgumentParser(description="Coinglass Heatmap Alert Runner (Telegram + Shock + Sheets + Milestones, multi-threshold & multi-level shock)")
     ap.add_argument("--windows", type=str, help='comma-separated window percents, e.g. "5,6,7"')
     ap.add_argument("--window", type=float, help="single window percent (convenience)")
     ap.add_argument("--thresholds", type=str, help='comma-separated crossing thresholds as fractions, e.g. "0.30,0.35,0.40"')
     ap.add_argument("--threshold", type=float, default=None, help="single crossing threshold (fraction), e.g. 0.30")
+    ap.add_argument("--shock-levels", type=str, help='comma-separated shock deltas as fractions, e.g. "0.30,0.35,0.40"')
     ap.add_argument("--interval", type=int, default=DEFAULT_INTERVAL_S, help="seconds between checks")
     ap.add_argument("--startup", choices=["over","all","none"], default="over",
                     help="first run: 'over' (alert if already ≥ thr), 'all' (alert everything once), 'none'")
@@ -636,13 +690,19 @@ def main():
 
     windows = parse_windows(args)
     thresholds = parse_thresholds(args)
+    shock_levels = parse_shock_levels(args)
+
+    # allow overriding globals for this run (so detect_shock sees the CLI levels)
+    global SHOCK_LEVELS
+    SHOCK_LEVELS = shock_levels
 
     print("=== Coinglass Heatmap Alert Runner (Telegram + Shock + Sheets + Milestones) ===", flush=True)
     print(f"Watchlist: {', '.join(WATCH_COINS)} | TFs: {', '.join(TIMEFRAMES)} | Windows: " +
           ", ".join(f"±{w:.0f}%" for w in windows), flush=True)
     print(f"crossing thr(s)={', '.join(f'±{int(t*100)}%' for t in thresholds)} | "
-          f"interval={args.interval}s | startup={args.startup}", flush=True)
-    print("shock rules: " + ", ".join(f"{tf}: Δ≥{r['delta']:.0%} in ≤{r['minutes']}m (cooldown {r['cooldown_min']}m)"
+          f"shock Δ-levels={', '.join(f'≥{int(s*100)}%' for s in shock_levels)}", flush=True)
+    print(f"interval={args.interval}s | startup={args.startup} | crossing_enabled={CROSSING_ENABLED} | shock_enabled={SHOCK_ENABLED}", flush=True)
+    print("shock windows: " + ", ".join(f"{tf}: ≤{r['minutes']}m (cooldown {r['cooldown_min']}m)"
                                       for tf,r in SHOCK_RULES.items()), flush=True)
     if args.reset_state:
         print("State: RESET", flush=True)

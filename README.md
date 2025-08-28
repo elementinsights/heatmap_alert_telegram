@@ -6,7 +6,7 @@ python3 -m venv venv
 source venv/bin/activate
 
 # 3) install deps
-pip install requests python-dotenv
+pip install python-dotenv requests gspread google-auth
 
 # 4) create .env in the SAME folder as the script
 #    (use the template below)
@@ -30,3 +30,42 @@ python3 alerts.py --startup all --reset-state (preferred)
 If you never want first-run alerts unless there’s a true crossing:
 
 python3 alerts.py --startup none --reset-state
+
+To upload updates:
+
+rsync -avz --delete \
+-e "ssh -i ~/.ssh/heatmap_do" \
+./heatmaps/ heatmap@206.189.79.36:/home/heatmap/heatmaps/
+
+Log in to server:
+
+ssh -i ~/.ssh/heatmap_do heatmap@206.189.79.36
+
+watch logs in real time:
+
+journalctl -u heatmap1 -f
+journalctl -u heatmap2 -f
+
+
+Stop scripts on server:
+
+sudo systemctl stop heatmap1 heatmap2
+
+
+Start scripts on server:
+
+sudo systemctl start heatmap1 heatmap2
+
+
+Restart both:
+
+sudo systemctl restart heatmap1 heatmap2
+
+
+Run from /heatmaps:
+
+cd /Users/jasonwuerch/Desktop/Projects/heatmaps/heatmap1
+source ../venv/bin/activate
+python alerts.py --startup none
+
+
