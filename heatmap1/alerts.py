@@ -59,9 +59,9 @@ DEFAULT_WINDOW_PCTS = [6.0, 7.0, 8.0]
 
 SHOCK_LEVELS = [.40, .50, .60]
 SHOCK_RULES = {
-    "12h": {"minutes": 60,  "cooldown_min": 0},
-    "24h": {"minutes": 180, "cooldown_min": 0},
-    "72h": {"minutes": 480, "cooldown_min": 0},
+    "12h": {"minutes": 60,  "cooldown_min": 5},
+    "24h": {"minutes": 180, "cooldown_min": 15},
+    "72h": {"minutes": 480, "cooldown_min": 30},
 }
 PERSISTENCE_MIN_SHOCK = {"12h": 0, "24h": 0, "72h": 0}
 
@@ -73,7 +73,7 @@ CROSSING_RULES = {
     "24h": {"cooldown_min": 15},
     "72h": {"cooldown_min": 30},
 }
-PERSISTENCE_MIN_CROSSING = {"12h": 3, "24h": 5, "72h": 12}
+PERSISTENCE_MIN_CROSSING = {"12h": 1, "24h": 2, "72h": 5}
 
 
 ### SUSTAINED RULES
