@@ -53,7 +53,7 @@ python3 alerts.py
 
 ### Upload updates (from parent folder on Mac)
 ```bash
-rsync -avz --progress   --exclude 'venv/'   --exclude '__pycache__/'   -e "ssh -i ~/.ssh/heatmap_do"   heatmap1 heatmap2   heatmap@206.189.79.36:/home/heatmap/heatmaps/
+rsync -avz --progress   --exclude 'venv/'   --exclude '__pycache__/'   -e "ssh -i ~/.ssh/heatmap_do"   heatmap1   heatmap@206.189.79.36:/home/heatmap/heatmaps/
 ```
 
 ### Log in to server
@@ -118,8 +118,3 @@ pip install requests python-dotenv gspread google-auth
 cd /Users/jasonwuerch/Desktop/Projects/heatmaps/heatmap1
 source ../venv/bin/activate
 python alerts.py
-
-cd /Users/jasonwuerch/Desktop/Projects/heatmaps/heatmap2
-source ../venv/bin/activate
-python alerts.py
-```
