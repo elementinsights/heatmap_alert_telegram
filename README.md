@@ -117,9 +117,9 @@ pip install requests python-dotenv gspread google-auth
 ```bash
 cd /Users/jasonwuerch/Desktop/Projects/heatmaps/heatmap1
 source ../venv/bin/activate
-python alerts.py --startup none
+python alerts.py
 
 cd /Users/jasonwuerch/Desktop/Projects/heatmaps/heatmap2
 source ../venv/bin/activate
-python alerts.py --startup none
+python alerts.py
 ```
