@@ -4,15 +4,16 @@ Coinglass Model-2 heatmap alert runner (Telegram + Google Sheets with milestones
 
 Focus: longer-term moves (≈5 minutes → a few hours)
 
-Key updates vs earlier versions:
-- Timeframes narrowed to 24h and 72h (macro context).
-- Default price windows widened to ±6–7% (heavier liquidity bands, fewer/noisier micro signals).
-- Crossing thresholds raised to ±40/50/60%.
-- Shock levels raised to Δ≥40/50/60%.
-- Shock windows lengthened (24h: 180m, 72h: 480m) with moderate cooldowns (20/30m).
-- Persistence gate for both crossing and shock alerts to avoid one-print spikes.
-- Single API fetch per coin×timeframe; reuse for all windows (efficiency).
-- Same Google Sheets milestone logging + Telegram messages as before.
+Key features:
+- Timeframes: 12h, 24h, 72h.
+- Price windows: ±6/7/8% (heavier liquidity bands).
+- Crossing thresholds: ±40/50/60%.
+- Shock levels: Δ≥40/50/60%.
+- Shock windows/cooldowns: 12h=60m/12m, 24h=180m/20m, 72h=480m/30m.
+- Persistence gates for crossings & shocks to avoid one-print spikes.
+- NEW: Sustained Imbalance alerts (imbalance ≥ threshold held for N minutes, with cooldown).
+- Single API fetch per coin×timeframe; reused across windows.
+- Google Sheets milestone logging + Telegram messages.
 
 ENV expected:
   COINGLASS_API_KEY
@@ -25,6 +26,7 @@ ENV expected:
   GSHEET_WEBHOOK_URL (optional fallback for appends)
   CROSSING_ENABLED=true/false (optional; default true)
   SHOCK_ENABLED=true/false (optional; default true)
+  SUSTAINED_ENABLED=true/false (optional; default true)
 """
 
 import os, json, math, time, argparse, requests, datetime as dt
@@ -35,8 +37,12 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 # Feature toggles (env)
-SHOCK_ENABLED = os.getenv("SHOCK_ENABLED", "true").strip().lower() in ("1","true","yes","on")
-CROSSING_ENABLED = os.getenv("CROSSING_ENABLED", "true").strip().lower() in ("1","true","yes","on")
+def _flag(name, default="true"):
+    return os.getenv(name, default).strip().lower() in ("1","true","yes","on")
+
+SHOCK_ENABLED     = _flag("SHOCK_ENABLED", "true")
+CROSSING_ENABLED  = _flag("CROSSING_ENABLED", "true")
+SUSTAINED_ENABLED = _flag("SUSTAINED_ENABLED", "true")
 
 # ========== CONFIG ==========
 API_HOST = "https://open-api-v4.coinglass.com"
@@ -44,10 +50,10 @@ COIN_ENDPOINT = "/api/futures/liquidation/aggregated-heatmap/model2"
 PAIR_ENDPOINT = "/api/futures/liquidation/heatmap/model2"
 
 WATCH_COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "HYPE", "LINK"]
-TIMEFRAMES  = ["24h", "72h"]  # macro focus
+TIMEFRAMES  = ["12h", "24h", "72h"]
 
 # Windows around price to sum liq levels (wider = fewer but heavier signals)
-DEFAULT_WINDOW_PCTS = [6.0, 7.0]
+DEFAULT_WINDOW_PCTS = [6.0, 7.0, 8.0]
 
 # Crossing thresholds (abs(imbalance) >= threshold)
 CROSSING_THRESHOLDS = [0.40, 0.50, 0.60]
@@ -55,6 +61,7 @@ CROSSING_THRESHOLDS = [0.40, 0.50, 0.60]
 # Shock: change in imbalance within a lookback window (minutes)
 # Minutes/cooldowns per timeframe (longer windows for regime shifts; moderate cooldowns for re-alerts)
 SHOCK_RULES = {
+    "12h": {"minutes": 60,  "cooldown_min": 12},
     "24h": {"minutes": 180, "cooldown_min": 20},
     "72h": {"minutes": 480, "cooldown_min": 30},
 }
@@ -66,14 +73,28 @@ DEFAULT_INTERVAL_S  = 60          # seconds between loops
 STATE_FILE          = "alerts_state.json"
 PER_REQUEST_PAUSE   = 0.5         # pause between API calls (politeness)
 
-# Require condition to persist before alerting (minutes)
+# Require condition to persist before alerting (minutes) for crossings & shocks
 PERSISTENCE_MIN = {
+    "12h": 3,
     "24h": 5,
     "72h": 10,
 }
 
-# How much history to retain (minutes)—keep above the largest shock window
-MAX_HISTORY_MINUTES = max(v["minutes"] for v in SHOCK_RULES.values()) * 3
+# NEW: Sustained Imbalance rules (per timeframe)
+# threshold: |imbalance| must be ≥ threshold
+# minutes:   must remain at/above threshold for N minutes (sign-aware)
+# cooldown_min: min minutes between re-alerts at the same sign/threshold
+SUSTAINED_RULES = {
+    "12h": {"threshold": 0.35, "minutes": 30,  "cooldown_min": 60},
+    "24h": {"threshold": 0.425, "minutes": 60,  "cooldown_min": 120},
+    "72h": {"threshold": 0.50, "minutes": 120, "cooldown_min": 180},
+}
+
+# How much history to retain (minutes)—keep above the largest analysis window
+MAX_HISTORY_MINUTES = max(
+    max(v["minutes"] for v in SHOCK_RULES.values()),
+    max(v["minutes"] for v in SUSTAINED_RULES.values())
+) * 3
 
 # Milestones schedule:
 # 1m: 1..5 | 5m: 10..30 step 5 | 15m: 45..360 step 15 | 30m: 390..720 step 30 | 60m: 780..4320 step 60
@@ -178,6 +199,9 @@ def format_shock_detail(prev_imb, now_imb, dt_min):
 def window_display(window_pct):
     return f"{float(window_pct):.0f}%"
 
+def lab_sign(s):
+    return "Above" if s > 0 else ("Below" if s < 0 else "Neutral")
+
 # ========== Data shaping ==========
 def last_close(price_candles):
     if not price_candles or len(price_candles[-1]) < 5:
@@ -237,12 +261,15 @@ def save_state(state: dict):
     except Exception:
         pass
 
-def new_alert_id(coin, tf, window_pct, ts, thr=None, shock_level=None):
+def new_alert_id(coin, tf, window_pct, ts, thr=None, shock_level=None, sustained=False, sustained_sign=None):
     base = f"{coin}|{tf}|{int(float(window_pct))}|{int(ts)}"
     if thr is not None:
         return f"{base}|thr{int(round(thr*100))}"
     if shock_level is not None:
         return f"{base}|shock{int(round(shock_level*100))}"
+    if sustained:
+        sign_lab = "abv" if (sustained_sign or 0) > 0 else ("blw" if (sustained_sign or 0) < 0 else "neu")
+        return f"{base}|sustain_{sign_lab}"
     return base
 
 def record_alert_pending(state, alert_id, sheet_row, base_price, ts):
@@ -410,7 +437,7 @@ def ensure_next_row_initialized(state):
     state["_next_row"] = max(last + 1, 2)
     return state["_next_row"]
 
-# ========== Persistence Gate ==========
+# ========== Persistence Helpers ==========
 def persisted(hist, now_ts, tf, cond_fn):
     """Return True if cond_fn(value) holds continuously for PERSISTENCE_MIN[tf] minutes."""
     need_sec = int(PERSISTENCE_MIN.get(tf, 0)) * 60
@@ -425,6 +452,21 @@ def persisted(hist, now_ts, tf, cond_fn):
         if not cond_fn(val):
             return False
     return saw_any  # ensure we actually covered the window
+
+def persisted_custom(hist, now_ts, minutes, cond_fn):
+    """Return True if cond_fn(value) holds continuously for the given minutes."""
+    need_sec = int(minutes) * 60
+    if need_sec <= 0:
+        return True
+    cutoff = now_ts - need_sec
+    saw_any = False
+    for ts, val in reversed(hist):
+        if ts < cutoff:
+            break
+        saw_any = True
+        if not cond_fn(val):
+            return False
+    return saw_any
 
 # ========== Shock detection (multi-level) ==========
 def prune_history(hist, now_ts):
@@ -495,7 +537,74 @@ def run_once(windows, thresholds, startup_mode, state):
                     print(line, flush=True); lines.append(line)
                     continue
 
-                # ---------- MULTI-LEVEL SHOCK (one state per coin×tf×window) ----------
+                # ---------- HISTORIES ----------
+                # Shared per-window history for sustained + crossings
+                base_hist_key = f"{coin}:{tf}:{window_pct}:base_hist"
+                base_hist = state.get(base_hist_key, [])
+                base_hist.append([now_ts, float(imb)])
+                base_hist = prune_history(base_hist, now_ts)
+                state[base_hist_key] = base_hist
+
+                # ---------- SUSTAINED IMBALANCE ----------
+                if SUSTAINED_ENABLED and tf in SUSTAINED_RULES:
+                    s_rule = SUSTAINED_RULES[tf]
+                    thr = float(s_rule["threshold"])
+                    dur = int(s_rule["minutes"])
+                    cd  = int(s_rule["cooldown_min"])
+
+                    sign_now = 1 if imb > 0 else (-1 if imb < 0 else 0)
+
+                    def cond_fn(v):
+                        # require magnitude & sign consistency during the sustained window
+                        sv = 1 if v > 0 else (-1 if v < 0 else 0)
+                        return abs(v) >= thr and sv == sign_now
+
+                    sustained_ok = abs(imb) >= thr and persisted_custom(base_hist, now_ts, dur, cond_fn)
+
+                    sustain_key = f"{coin}:{tf}:{window_pct}:sustain"
+                    sustain_rec = state.get(sustain_key, {})
+                    last_any_utc = sustain_rec.get("last_any_utc")
+                    last_sign = int(sustain_rec.get("last_sign", 0))
+
+                    should_alert = False
+                    if sustained_ok:
+                        # alert if sign changed or cooldown elapsed
+                        if last_sign != sign_now:
+                            should_alert = True
+                        elif cooldown_ok(last_any_utc, cd, now_ts):
+                            should_alert = True
+
+                    if should_alert and sign_now != 0:
+                        parts = [
+                            f"<b>Heatmap Alert</b> {coin} • {tf} • ±{float(window_pct):.0f}% window",
+                            f"⚖️ Sustained imbalance ≥{int(thr*100)}% for {dur}m",
+                            f"Side: <b>{lab_sign(sign_now)}</b> • Current: {imb:.2%}",
+                            f"Above: ${ta:,.0f} • Below: ${tb:,.0f}",
+                            f"Source: {source}",
+                            f"Params: {params}",
+                            f"UTC: {utc_now}",
+                        ]
+                        send_telegram("\n".join(parts))
+
+                        # Sheet row
+                        date_str = utc_now_dt.strftime("%Y-%m-%d")
+                        time_str = utc_now_dt.strftime("%H:%M:%S")
+                        label = f"sustained ≥{int(thr*100)}% for {dur}m ({lab_sign(sign_now)}) • imb={imb:.2%}"
+                        row_values = [date_str, time_str, coin, round(price, 4), tf,
+                                      window_display(window_pct), label] + \
+                                     [""] * len(DELTA_MILESTONES_MIN)
+                        staged_rows.append(row_values)
+
+                        aid = new_alert_id(coin, tf, window_pct, now_ts, sustained=True, sustained_sign=sign_now)
+                        staged_meta.append({"aid": aid, "coin": coin, "base_price": price, "ts": now_ts})
+
+                        sustain_rec["last_any_utc"] = now_utc().isoformat()
+                        sustain_rec["last_sign"] = sign_now
+
+                    sustain_rec["last_checked_utc"] = now_utc().isoformat()
+                    state[sustain_key] = sustain_rec
+
+                # ---------- MULTI-LEVEL SHOCK ----------
                 if SHOCK_ENABLED:
                     shock_key = f"{coin}:{tf}:{window_pct}:shock"
                     shock_rec = state.get(shock_key, {})
@@ -505,10 +614,10 @@ def run_once(windows, thresholds, startup_mode, state):
 
                     level, prev_imb, dt_min = detect_shock(tf, shock_hist[:-1], imb, now_ts, SHOCK_LEVELS)
 
-                    # Optional: persistence gate for shocks (delta-based)
+                    # Persistence gate for shocks (delta-based)
                     if level is not None:
-                        def cond_fn(prev_v): return abs(imb - prev_v) >= level
-                        if not persisted(shock_hist, now_ts, tf, cond_fn):
+                        def cond_delta(prev_v): return abs(imb - prev_v) >= level
+                        if not persisted(shock_hist, now_ts, tf, cond_delta):
                             level = None
 
                     rule = SHOCK_RULES[tf]
@@ -554,6 +663,7 @@ def run_once(windows, thresholds, startup_mode, state):
                     state[shock_key] = shock_rec
 
                 # ---------- MULTI-THRESHOLD CROSSINGS ----------
+                # ---------- MULTI-THRESHOLD CROSSINGS ----------
                 if CROSSING_ENABLED:
                     for thr in thresholds:
                         key = f"{coin}:{tf}:{window_pct}:thr={int(round(thr*100))}"
@@ -564,23 +674,33 @@ def run_once(windows, thresholds, startup_mode, state):
 
                         prev_active = bool(rec.get("active"))
                         prev_sign = int(rec.get("sign", 0))
+                        prev_persist = bool(rec.get("persist_ok", False))
+
                         active_now = abs(imb) >= thr
                         sign_now = 1 if imb > 0 else (-1 if imb < 0 else 0)
 
-                        # Persistence gate for crossings
+                        # Persistence gate for crossings (same sign during window)
                         def _sign(v): return 1 if v > 0 else (-1 if v < 0 else 0)
-                        def cond_fn(v): return abs(v) >= thr and _sign(v) == sign_now
-                        persist_ok = persisted(hist, now_ts, tf, cond_fn)
+                        def cond_cross(v): return abs(v) >= thr and _sign(v) == sign_now
+                        persist_ok = persisted(hist, now_ts, tf, cond_cross)
 
-                        crossed = False; reason = ""
+                        now_persist = active_now and persist_ok
+
+                        crossed = False
+                        reason = ""
+
                         if "active" not in rec:
+                            # first-ever evaluation for this (coin,tf,window,thr)
                             if startup_mode == "all":
                                 crossed = True; reason = "initial(all)"
-                            elif startup_mode == "over" and active_now and persist_ok:
+                            elif startup_mode == "over" and now_persist:
                                 crossed = True; reason = "initial(over+persist)"
                         else:
-                            crossed = active_now and persist_ok and (not prev_active or prev_sign != sign_now)
-                            if crossed: reason = "crossing+persist"
+                            # Fire when we newly satisfy persistence, or on sign flip while persisted
+                            if now_persist and (not prev_persist):
+                                crossed = True; reason = "persisted(new)"
+                            elif now_persist and (prev_sign != sign_now):
+                                crossed = True; reason = "sign flip (persisted)"
 
                         if crossed:
                             parts = [f"<b>Heatmap Alert</b> {coin} • {tf} • ±{float(window_pct):.0f}% window • thr=±{int(thr*100)}%"]
@@ -591,7 +711,7 @@ def run_once(windows, thresholds, startup_mode, state):
                                 f"Source: {source}",
                                 f"Params: {params}",
                                 f"UTC: {utc_now}",
-                                f"Note: {reason}" if reason else "",
+                                f"Note: {reason}",
                             ]
                             send_telegram("\n".join(parts))
 
@@ -600,23 +720,17 @@ def run_once(windows, thresholds, startup_mode, state):
                             alert_label = "crossing: " + format_crossing_detail(imb, prev_sign, sign_now, thr)
                             row_values = [date_str, time_str, coin, round(price, 4), tf,
                                           window_display(window_pct),
-                                          f"thr=±{int(thr*100)}% • {alert_label}"] + \
-                                         [""] * len(DELTA_MILESTONES_MIN)
+                                          f"thr=±{int(thr*100)}% • {alert_label}"] + [""] * len(DELTA_MILESTONES_MIN)
                             staged_rows.append(row_values)
 
                             aid = new_alert_id(coin, tf, window_pct, now_ts, thr=thr)
                             staged_meta.append({"aid": aid, "coin": coin, "base_price": price, "ts": now_ts})
 
-                        # Per-threshold status line
-                        line = (
-                            f"{utc_now} | {coin:<5} {tf:<4} | win=±{float(window_pct):.0f}% | thr=±{int(thr*100)}% | "
-                            f"imb={imb:>+6.2%} | above=${ta:>12,.0f} | below=${tb:>12,.0f}"
-                        )
-                        print(line, flush=True); lines.append(line)
-
+                        # always update state
                         rec.update({
                             "active": active_now,
                             "sign": sign_now,
+                            "persist_ok": now_persist,   # <-- NEW: remember persistence state
                             "last_imbalance": float(imb),
                             "last_checked_utc": now_utc().isoformat(),
                             "hist": hist,
@@ -727,9 +841,9 @@ def parse_shock_levels(args):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Coinglass Heatmap Alert Runner (Telegram + Shock + Sheets + Milestones; macro-focused: 24h/72h, ±6–7% windows, ±40/50/60% thresholds, Δ≥40/50/60% shocks)"
+        description="Coinglass Heatmap Alert Runner (Telegram + Shock + Sustained + Sheets; 12h/24h/72h, ±6–8% windows, ±40/50/60% thresholds, Δ≥40/50/60% shocks)"
     )
-    ap.add_argument("--windows", type=str, help='comma-separated window percents, e.g. "6,7"')
+    ap.add_argument("--windows", type=str, help='comma-separated window percents, e.g. "6,7,8"')
     ap.add_argument("--window", type=float, help="single window percent (convenience)")
     ap.add_argument("--thresholds", type=str, help='comma-separated crossing thresholds as fractions, e.g. "0.40,0.50,0.60"')
     ap.add_argument("--threshold", type=float, default=None, help="single crossing threshold (fraction), e.g. 0.50")
@@ -748,14 +862,17 @@ def main():
     global SHOCK_LEVELS
     SHOCK_LEVELS = shock_levels
 
-    print("=== Coinglass Heatmap Alert Runner (Telegram + Shock + Sheets + Milestones) ===", flush=True)
+    print("=== Coinglass Heatmap Alert Runner (Telegram + Shock + Sustained + Sheets + Milestones) ===", flush=True)
     print(f"Watchlist: {', '.join(WATCH_COINS)} | TFs: {', '.join(TIMEFRAMES)} | Windows: " +
           ", ".join(f"±{w:.0f}%" for w in windows), flush=True)
     print(f"crossing thr(s)={', '.join(f'±{int(t*100)}%' for t in thresholds)} | "
           f"shock Δ-levels={', '.join(f'≥{int(s*100)}%' for s in shock_levels)}", flush=True)
-    print(f"interval={args.interval}s | startup={args.startup} | crossing_enabled={CROSSING_ENABLED} | shock_enabled={SHOCK_ENABLED}", flush=True)
+    print(f"interval={args.interval}s | startup={args.startup} | "
+          f"crossing_enabled={CROSSING_ENABLED} | shock_enabled={SHOCK_ENABLED} | sustained_enabled={SUSTAINED_ENABLED}", flush=True)
     print("shock windows: " + ", ".join(f"{tf}: ≤{r['minutes']}m (cooldown {r['cooldown_min']}m)"
                                       for tf,r in SHOCK_RULES.items()), flush=True)
+    print("sustained rules: " + ", ".join(f"{tf}: ≥{int(SUSTAINED_RULES[tf]['threshold']*100)}% for {SUSTAINED_RULES[tf]['minutes']}m (cooldown {SUSTAINED_RULES[tf]['cooldown_min']}m)"
+                                      for tf in TIMEFRAMES if tf in SUSTAINED_RULES), flush=True)
     if args.reset_state:
         print("State: RESET", flush=True)
     print("Ctrl-C to stop.\n", flush=True)
